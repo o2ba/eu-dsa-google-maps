@@ -14,6 +14,7 @@ from land import downloader, unzipper, explorer
 from transform.normalizer import normalize_df
 from utils.pd_utils import df_from_parquet
 from upload.model import StatementOfReasons
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from repository.ledger import IngestionLedgerRepository
 
 from tqdm import tqdm
@@ -35,13 +36,16 @@ def ingest_date(date: str, target_platform: str = "Google Maps"):
         )
 
         try:
-            for file in tqdm(parquet_files, desc=f"Processing {date}", unit="file"):
-                normalized_df = _transform_file(file, target_platform, event_id)
-                if normalized_df is None:
-                    continue
-
-                rows = _load_to_db(normalized_df, ledger.uuid, file, event_id)
-                total_rows_ingested += rows
+            with ThreadPoolExecutor(max_workers=5) as executor:
+                futures = [
+                    executor.submit(
+                        _process_and_load, file, target_platform, ledger.uuid, event_id
+                    )
+                    for file in parquet_files
+                ]
+                for f in tqdm(as_completed(futures), total=len(futures), desc=f"Processing {date}"):
+                    rows = f.result()
+                    total_rows_ingested += rows
 
             IngestionLedgerRepository.mark_success(
                 session, ledger, rows_ingested=total_rows_ingested
@@ -53,8 +57,13 @@ def ingest_date(date: str, target_platform: str = "Google Maps"):
             )
             raise
         finally:
-            # Cleanup on fail
             delete_file(event_id=event_id, path=extract_dir, context="post-processing cleanup")
+
+def _process_and_load(file, target_platform, ledger_id, event_id):
+    normalized_df = _transform_file(file, target_platform, event_id)
+    if normalized_df is not None:
+        return _load_to_db(normalized_df, ledger_id, file, event_id)
+    return 0
 
 def _land_extract(date: str, event_id: str):
     """Download, unzip, and find parquet files for a given date."""
