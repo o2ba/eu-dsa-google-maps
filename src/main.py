@@ -1,107 +1,59 @@
-import os
-import pandas as pd
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-from datetime import datetime
-from uuid import uuid4
+from datetime import datetime, timedelta
+from ingest_date import ingest_date
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from utils.temp_utils import create_temp_dir, delete_file
-from utils.logger import log_event
-
-from land import downloader, unzipper, explorer
-from transform.normalizer import normalize_df
-from utils.pd_utils import df_from_parquet
-from upload.model import StatementOfReasons
-from repository.ledger import IngestionLedgerRepository
-
-from tqdm import tqdm
 import typer
 
-DATABASE_URL = os.getenv("DATABASE_URL")
-engine = create_engine(DATABASE_URL)
-SessionLocal = sessionmaker(bind=engine)
+def parse_date_range(rng: str) -> list[str]:
+    """Parse YYYY-MM-DD:YYYY-MM-DD → list of iso date strings."""
+    try:
+        start_str, end_str = rng.split(":")
+        start = datetime.strptime(start_str, "%Y-%m-%d").date()
+        end = datetime.strptime(end_str, "%Y-%m-%d").date()
+    except Exception as e:
+        raise typer.BadParameter(f"Invalid --range value {rng}: {e}")
+
+    if end < start:
+        raise typer.BadParameter("End date must be >= start date")
+
+    delta = (end - start).days
+    return [(start + timedelta(days=i)).isoformat() for i in range(delta + 1)]
 
 
-def main(date: str, target_platform: str = "Google Maps"):
-    event_id = str(uuid4())
-    total_rows_ingested = 0
+def main(
+    date: str = typer.Option(None, "--date", "-d", help="Single date YYYY-MM-DD"),
+    date_range: str = typer.Option(
+        None, "--range", "-r", help="Date range in format YYYY-MM-DD:YYYY-MM-DD"
+    ),
+    target_platform: str = typer.Option("Google Maps", "--platform", "-p"),
+    max_threads: int = typer.Option(5, "--max-threads", help="Max threads"),
+):
+    if (date is None) and (date_range is None):
+        raise typer.BadParameter("Pass either --date or --range")
 
-    # 🟡 LAND → download/unzip/parquet discovery
-    tmp_file = downloader.download_day(date, to_temp=True, event_id=event_id)
-    extract_dir = create_temp_dir(prefix=f"dsa_extract_{date}_")
-    unzipped_path = unzipper.unzip_file(tmp_file, extract_dir, event_id=event_id)
-    delete_file(event_id=event_id, path=tmp_file, context="post-unzip cleanup")
-    parquet_files = explorer.find_parquet_files(unzipped_path, event_id=event_id)
+    if date and date_range:
+        raise typer.BadParameter("Only specify one of --date or --range")
 
-    with SessionLocal() as session:
-        ledger = IngestionLedgerRepository.start_run(
-            session, file_date=date, event_id=event_id
-        )
+    if date:
+        # single date ingestion
+        ingest_date(date, target_platform)
+        return
 
-        try:
-            for file in tqdm(parquet_files, desc="Processing Parquet Files", unit="file"):
-                # 🟡 EXTRACT raw parquet
-                raw_df = df_from_parquet(file)
-                delete_file(event_id=event_id, path=file, context="post-read cleanup")
+    # date_range mode
+    dates = parse_date_range(date_range)
+    typer.echo(f"[ℹ] Processing {len(dates)} dates from {dates[0]} → {dates[-1]} with {max_threads} threads")
 
-                # 🟡 FILTER by platform
-                raw_df = raw_df.loc[raw_df["platform_name"] == target_platform]
-                if raw_df.empty:
-                    del raw_df
-                    continue
-
-                # 🟡 TRANSFORM to DB-safe dataframe
-                normalized_df = normalize_df(raw_df, StatementOfReasons, file)
-                del raw_df
-
-                if normalized_df.empty:
-                    log_event(
-                        f"No valid data found in parquet after normalization: {file}",
-                        level="warning",
-                        file=file,
-                        event_id=event_id,
-                    )
-                    del normalized_df
-                    continue
-
-                # Inject ingestion_id for linkage
-                normalized_df["ingestion_id"] = ledger.uuid
-
-                log_event(
-                    f"Prepared {len(normalized_df)} rows for ingestion from {file}",
-                    file=file,
-                    event_id=event_id,
-                    rowcount=len(normalized_df),
-                )
-
-                # 🟡 LOAD into DB
-                normalized_df.to_sql(
-                    StatementOfReasons.__tablename__,
-                    engine,
-                    if_exists="append",
-                    index=False,
-                    method="multi",
-                    chunksize=10_000,  # safe chunk size
-                )
-
-                total_rows_ingested += len(normalized_df)
-                del normalized_df
-
-            # 🟢 Mark ledger success
-            IngestionLedgerRepository.mark_success(
-                session, ledger, rows_ingested=total_rows_ingested
-            )
-
-        except Exception as e:
-            # 🔴 Mark ledger failure
-            IngestionLedgerRepository.mark_failure(
-                session, ledger, error_message=str(e)
-            )
-            raise
-
-    # 🟡 CLEANUP
-    delete_file(event_id=event_id, path=extract_dir, context="post-processing cleanup")
-
+    with ThreadPoolExecutor(max_workers=max_threads) as executor:
+        futures = {
+            executor.submit(ingest_date, d, target_platform): d for d in dates
+        }
+        for fut in as_completed(futures):
+            d = futures[fut]
+            try:
+                fut.result()
+                typer.echo(f"[✔] {d} complete")
+            except Exception as e:
+                typer.echo(f"[✘] {d} failed: {e}")
 
 if __name__ == "__main__":
     typer.run(main)
