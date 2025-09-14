@@ -1,0 +1,16 @@
+boto3
+aiohttp
+aiofiles
+python-dotenv
+loguru
+pandas
+pyarrow
+polars
+sqlalchemy
+typer
+requests
+tqdm
+axiom-py
+uuid-utils
+alembic
+psycopg2

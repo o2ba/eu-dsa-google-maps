@@ -1,0 +1,14 @@
+.vscode
+.kiro
+dsa-tdb/
+**/.env
+**/target/*
+Makefile
+.venv
+.tfvars
+data-lander-ecs
+dsa-cli
+*.hcl
+*.tfstate*
+**/*/*.pyc
+.DS_Store
