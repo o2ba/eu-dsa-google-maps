@@ -101,16 +101,16 @@ def _process_and_load_snowflake(file: str, target_platform: str, event_id: str) 
     finally:
         cs.close()
         conn.close()
-        delete_file(event_id=event_id, path=file, context="post-load cleanup")
-        delete_file(event_id=event_id, path=norm_file, context="temp parquet cleanup")
+        delete_file(path=file, context="post-load cleanup")
+        delete_file(path=norm_file, context="temp parquet cleanup")
 
 
 def _land_extract(date: str, event_id: str):
     """Download, unzip, and find parquet files for a given date."""
-    tmp_file = downloader.download_day(date, to_temp=True, event_id=event_id)
+    tmp_file = downloader.download_day(date, to_temp=True)
     extract_dir = create_temp_dir(prefix=f"dsa_extract_{date}_")
     unzipped_path = unzipper.unzip_file(tmp_file, extract_dir, event_id=event_id)
-    delete_file(event_id=event_id, path=tmp_file, context="post-unzip cleanup")
+    delete_file(path=tmp_file, context="post-unzip cleanup")
     parquet_files = explorer.find_parquet_files(unzipped_path, event_id=event_id)
     return extract_dir, parquet_files
 
@@ -118,7 +118,7 @@ def _land_extract(date: str, event_id: str):
 def _transform_file(file: str, target_platform: str, event_id: str):
     """Read parquet → filter → normalize dataframe."""
     raw_df = df_from_parquet(file)
-    delete_file(event_id=event_id, path=file, context="post-read cleanup")
+    delete_file(path=file, context="post-read cleanup")
 
     # Filter by platform
     raw_df = raw_df.loc[raw_df["platform_name"] == target_platform]

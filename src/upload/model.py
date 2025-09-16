@@ -1,28 +1,27 @@
-from sqlalchemy import Column, Integer, Date, Boolean, Text, func
+from sqlalchemy import Column, Date, Boolean, Text, func
 from sqlalchemy.inspection import inspect
-from sqlalchemy.dialects.postgresql import UUID, JSONB, TIMESTAMP
 from sqlalchemy.orm import declarative_base
-from sqlalchemy import Column, ForeignKey
-from sqlalchemy.orm import relationship
+from sqlalchemy import Column
 from snowflake.sqlalchemy import VARIANT, STRING
-from sqlalchemy.orm import relationship, declarative_base
+from sqlalchemy.orm import declarative_base
+from snowflake.sqlalchemy import TIMESTAMP_TZ
 
 Base = declarative_base()
 
 class StatementOfReasons(Base):
+    """
+    We preserve the model here for schema introspection.
+    This helps us convert dataframes to the right shape (normalize_df).
+    """
+
     __tablename__ = "statement_of_reasons"
 
-    # Snowflake: STRING DEFAULT UUID_STRING()
     uuid = Column(
         STRING(36),
         primary_key=True,
-        server_default=func.uuid_string()  # Use DB default, matches Snowflake DDL
+        server_default=func.uuid_string()
     )
 
-    # In your DDL: ingestion_id STRING
-    ingestion_id = Column(STRING(36), ForeignKey("ingestion_ledger.uuid"))
-
-    # VARIANT maps to Snowflake JSON-like storage
     decision_visibility = Column(VARIANT)
     decision_visibility_other = Column(Text)
     end_date_visibility_restriction = Column(Date)
@@ -70,12 +69,10 @@ class StatementOfReasons(Base):
     platform_name = Column(Text)
     platform_uid = Column(Text)
 
-    created_at = Column(TIMESTAMP(timezone=True))
+    created_at = Column(TIMESTAMP_TZ(timezone=True))
     loaded_at = Column(
-        TIMESTAMP(timezone=True), server_default=func.current_timestamp()
+        TIMESTAMP_TZ(timezone=True), server_default=func.current_timestamp()
     )
-
-    ingestion = relationship("IngestionLedger", back_populates="statements")
 
 def get_model_schema(model_cls):
     mapper = inspect(model_cls)
