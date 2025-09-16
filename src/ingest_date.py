@@ -95,7 +95,8 @@ def _process_and_load_snowflake(
             FROM @%STATEMENT_OF_REASONS
             FILE_FORMAT=(TYPE=PARQUET)
             MATCH_BY_COLUMN_NAME=CASE_INSENSITIVE
-            ON_ERROR=CONTINUE;
+            ON_ERROR=CONTINUE
+            FORCE=TRUE;
         """)
         tqdm.write(f"[{label}] COPY INTO complete")
 
