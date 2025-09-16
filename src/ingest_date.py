@@ -1,69 +1,109 @@
 """
-Runs the pipeline to ingest data for a single day.
+Runs the pipeline to ingest data for a single day into Snowflake.
 """
 import os
+import tempfile
 import pandas as pd
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+import pyarrow as pa
+import pyarrow.parquet as pq
 from uuid import uuid4
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from tqdm import tqdm
+import snowflake.connector
 
+from upload.model import StatementOfReasons
 from utils.temp_utils import create_temp_dir, delete_file
 from utils.logger import log_event
-
 from land import downloader, unzipper, explorer
 from transform.normalizer import normalize_df
 from utils.pd_utils import df_from_parquet
-from upload.model import StatementOfReasons
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from repository.ledger import IngestionLedgerRepository
 
-from tqdm import tqdm
-
-
-DATABASE_URL = os.getenv("DATABASE_URL")
-engine = create_engine(DATABASE_URL)
-SessionLocal = sessionmaker(bind=engine)
+SNOWFLAKE_USER = os.getenv("SNOWFLAKE_USER")
+SNOWFLAKE_PASSWORD = os.getenv("SNOWFLAKE_PASSWORD")
+SNOWFLAKE_ACCOUNT = os.getenv("SNOWFLAKE_ACCOUNT")
+SNOWFLAKE_WAREHOUSE = os.getenv("SNOWFLAKE_WAREHOUSE", "INGEST_DSA_WH")
+SNOWFLAKE_DATABASE = os.getenv("SNOWFLAKE_DATABASE", "DIGITAL_SERVICES_ACT")
+SNOWFLAKE_SCHEMA = os.getenv("SNOWFLAKE_SCHEMA", "PUBLIC")
 
 
-def ingest_date(date: str, target_platform: str = "Google Maps"):
+def ingest_date_snowflake(date: str, target_platform: str = "Google Maps"):
+    """
+    Ingest a given day's parquet files into Snowflake.
+    """
     event_id = str(uuid4())
-    total_rows_ingested = 0
     extract_dir, parquet_files = _land_extract(date, event_id)
 
-    with SessionLocal() as session:
-        ledger = IngestionLedgerRepository.start_run(
-            session, file_date=date, event_id=event_id
+    try:
+        total_rows = 0
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = [
+                executor.submit(_process_and_load_snowflake, f, target_platform, event_id)
+                for f in parquet_files
+            ]
+            for f in tqdm(as_completed(futures), total=len(futures), desc=f"Processing {date}"):
+                total_rows += f.result()
+
+        log_event(
+            f"Ingested {total_rows} rows for {date}",
+            event_id=event_id,
+            event_type="ingestion_summary",
+            rowcount=total_rows,
         )
+    finally:
+        delete_file(event_id=event_id, path=extract_dir, context="cleanup")
 
-        try:
-            with ThreadPoolExecutor(max_workers=5) as executor:
-                futures = [
-                    executor.submit(
-                        _process_and_load, file, target_platform, ledger.uuid, event_id
-                    )
-                    for file in parquet_files
-                ]
-                for f in tqdm(as_completed(futures), total=len(futures), desc=f"Processing {date}"):
-                    rows = f.result()
-                    total_rows_ingested += rows
 
-            IngestionLedgerRepository.mark_success(
-                session, ledger, rows_ingested=total_rows_ingested
-            )
-
-        except Exception as e:
-            IngestionLedgerRepository.mark_failure(
-                session, ledger, error_message=str(e)
-            )
-            raise
-        finally:
-            delete_file(event_id=event_id, path=extract_dir, context="post-processing cleanup")
-
-def _process_and_load(file, target_platform, ledger_id, event_id):
+def _process_and_load_snowflake(file: str, target_platform: str, event_id: str) -> int:
+    """
+    Transform a file (filter + normalize), write to temp parquet,
+    and load into Snowflake via PUT + COPY INTO.
+    """
     normalized_df = _transform_file(file, target_platform, event_id)
-    if normalized_df is not None:
-        return _load_to_db(normalized_df, ledger_id, file, event_id)
-    return 0
+    if normalized_df is None or normalized_df.empty:
+        return 0
+
+    tmp_dir = tempfile.mkdtemp(prefix=f"snowflake_norm_{event_id}_")
+    norm_file = os.path.join(tmp_dir, os.path.basename(file).replace(".parquet", "-norm.parquet"))
+
+    table = pa.Table.from_pandas(normalized_df, preserve_index=False)
+    pq.write_table(table, norm_file)
+
+    # Connect to Snowflake
+    conn = snowflake.connector.connect(
+        user=SNOWFLAKE_USER,
+        password=SNOWFLAKE_PASSWORD,
+        account=SNOWFLAKE_ACCOUNT,
+        warehouse=SNOWFLAKE_WAREHOUSE,
+        database=SNOWFLAKE_DATABASE,
+        schema=SNOWFLAKE_SCHEMA,
+    )
+    cs = conn.cursor()
+
+    try:
+        cs.execute(f"PUT file://{norm_file} @%STATEMENT_OF_REASONS AUTO_COMPRESS=TRUE")
+
+        # Copy into table
+        cs.execute("""
+            COPY INTO STATEMENT_OF_REASONS
+            FROM @%STATEMENT_OF_REASONS
+            FILE_FORMAT=(TYPE=PARQUET)
+            MATCH_BY_COLUMN_NAME=CASE_INSENSITIVE
+            ON_ERROR=CONTINUE;
+        """)
+
+        log_event(
+            f"Loaded {len(normalized_df)} rows into Snowflake from {file}",
+            event_id=event_id,
+            file=file,
+            rowcount=len(normalized_df),
+        )
+        return len(normalized_df)
+    finally:
+        cs.close()
+        conn.close()
+        delete_file(event_id=event_id, path=file, context="post-load cleanup")
+        delete_file(event_id=event_id, path=norm_file, context="temp parquet cleanup")
+
 
 def _land_extract(date: str, event_id: str):
     """Download, unzip, and find parquet files for a given date."""
@@ -76,20 +116,20 @@ def _land_extract(date: str, event_id: str):
 
 
 def _transform_file(file: str, target_platform: str, event_id: str):
-    """Read parquet -> filter -> normalize dataframe."""
+    """Read parquet → filter → normalize dataframe."""
     raw_df = df_from_parquet(file)
     delete_file(event_id=event_id, path=file, context="post-read cleanup")
 
-    # Filter
+    # Filter by platform
     raw_df = raw_df.loc[raw_df["platform_name"] == target_platform]
     if raw_df.empty:
         return None
 
-    # Normalize
+    # Pass the model class so normalize_df can map schema
     normalized_df = normalize_df(raw_df, StatementOfReasons, file)
     if normalized_df.empty:
         log_event(
-            f"No valid data found after normalization: {file}",
+            f"No valid data after normalization: {file}",
             level="warning",
             file=file,
             event_id=event_id,
@@ -97,24 +137,3 @@ def _transform_file(file: str, target_platform: str, event_id: str):
         return None
 
     return normalized_df
-
-
-def _load_to_db(df: pd.DataFrame, ingestion_id: str, file: str, event_id: str):
-    """Attach ledger id and insert dataframe into DB."""
-    df["ingestion_id"] = ingestion_id
-    log_event(
-        f"Prepared {len(df)} rows for ingestion from {file}",
-        file=file,
-        event_id=event_id,
-        event_type="ingestion_prep",
-        rowcount=len(df),
-    )
-    df.to_sql(
-        StatementOfReasons.__tablename__,
-        engine,
-        if_exists="append",
-        index=False,
-        method="multi",
-        chunksize=10_000,
-    )
-    return len(df)

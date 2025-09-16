@@ -7,7 +7,7 @@ def normalize_df(df: pd.DataFrame, model_cls, file: str) -> pd.DataFrame:
     schema = get_model_schema(model_cls)
 
     normalized = {}
-    # Handle only known columns
+
     for col_name, col_type in schema.items():
         if col_name in df.columns:
             normalized[col_name] = df[col_name].apply(

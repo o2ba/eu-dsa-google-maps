@@ -3,27 +3,31 @@ import uuid
 import pandas as pd
 import pytz
 from utils.logger import log_event
-from sqlalchemy import Column, String, Date, Boolean, Text
-from sqlalchemy.dialects.postgresql import UUID, JSONB, TIMESTAMP
+from sqlalchemy import Date, Boolean, Text, String, TIMESTAMP
+from snowflake.sqlalchemy import VARIANT
+
 
 def convert_value(value, col_type, col_name, file):
     """
     Convert a parquet value into a DB-compatible Python object
-    based on SQLAlchemy column type.
+    based on SQLAlchemy column type for Snowflake.
     """
     try:
         if pd.isna(value):
             return None
 
-        # UUID
-        if isinstance(col_type, UUID):
-            return uuid.UUID(str(value))
+        # UUID-like strings (Snowflake stores UUID as STRING(36))
+        if isinstance(col_type, String) and getattr(col_type, "length", None) == 36:
+            try:
+                return str(uuid.UUID(str(value)))  # validate it's a real UUID
+            except Exception:
+                return str(value)  # fallback: just store as string
 
         # DATE
         if isinstance(col_type, Date):
             return pd.to_datetime(value, errors="coerce").date()
 
-        # TIMESTAMPTZ (timestamp with time zone)
+        # TIMESTAMP_TZ (Snowflake) = TIMESTAMP(timezone=True)
         if isinstance(col_type, TIMESTAMP) and col_type.timezone:
             ts = pd.to_datetime(value, errors="coerce", utc=True)
             if pd.isna(ts):
@@ -38,22 +42,22 @@ def convert_value(value, col_type, col_name, file):
                 return bool(int(value))
             return bool(value)
 
-        # JSONB
-        if isinstance(col_type, JSONB):
+        # VARIANT (Snowflake JSON type)
+        if isinstance(col_type, VARIANT):
             if isinstance(value, (dict, list)):
-                return json.dumps(value)
+                return value
             if isinstance(value, str):
                 try:
-                    json.loads(value)
-                    return value
+                    return json.loads(value)  # if it's valid JSON, return dict/list
                 except Exception:
-                    return json.dumps({"raw": value})
+                    return {"raw": value}  # fallback: wrap raw string
+            return value  # primitives (int/float/bool) are allowed in VARIANT
 
-        # TEXT (or default)
-        if isinstance(col_type, Text):
+        # TEXT / STRING
+        if isinstance(col_type, (Text, String)):
             return str(value)
 
-        # If unknown type, just return as-is
+        # Default passthrough
         return value
 
     except Exception as e:
@@ -64,3 +68,4 @@ def convert_value(value, col_type, col_name, file):
             file=file,
             error=str(e),
         )
+        return None

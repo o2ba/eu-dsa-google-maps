@@ -4,41 +4,26 @@ from sqlalchemy.dialects.postgresql import UUID, JSONB, TIMESTAMP
 from sqlalchemy.orm import declarative_base
 from sqlalchemy import Column, ForeignKey
 from sqlalchemy.orm import relationship
-import uuid
+from snowflake.sqlalchemy import VARIANT, STRING
+from sqlalchemy.orm import relationship, declarative_base
 
 Base = declarative_base()
-
-
-class IngestionLedger(Base):
-    __tablename__ = "ingestion_ledger"
-
-    uuid = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-
-    file_date = Column(Date, nullable=False)  
-    event_id = Column(UUID(as_uuid=True), nullable=False, unique=True)
-
-    started_at = Column(TIMESTAMP(timezone=True),
-                        nullable=False,
-                        server_default=func.now())
-    finished_at = Column(TIMESTAMP(timezone=True))
-
-    rows_ingested = Column(Integer, default=0)
-
-    success = Column(Boolean, default=False, nullable=False)
-    error_message = Column(Text)
-
-    statements = relationship("StatementOfReasons", back_populates="ingestion")
-
 
 class StatementOfReasons(Base):
     __tablename__ = "statement_of_reasons"
 
-    uuid = Column(UUID(as_uuid=True), primary_key=True,
-                  default=uuid.uuid4)
-    
-    ingestion_id = Column(UUID(as_uuid=True), ForeignKey("ingestion_ledger.uuid"))
+    # Snowflake: STRING DEFAULT UUID_STRING()
+    uuid = Column(
+        STRING(36),
+        primary_key=True,
+        server_default=func.uuid_string()  # Use DB default, matches Snowflake DDL
+    )
 
-    decision_visibility = Column(JSONB)
+    # In your DDL: ingestion_id STRING
+    ingestion_id = Column(STRING(36), ForeignKey("ingestion_ledger.uuid"))
+
+    # VARIANT maps to Snowflake JSON-like storage
+    decision_visibility = Column(VARIANT)
     decision_visibility_other = Column(Text)
     end_date_visibility_restriction = Column(Date)
 
@@ -66,26 +51,29 @@ class StatementOfReasons(Base):
     category_specification = Column(Text)
     category_specification_other = Column(Text)
 
-    content_type = Column(JSONB)
+    content_type = Column(VARIANT)
     content_type_other = Column(Text)
     content_language = Column(Text)
     content_date = Column(Date)
     content_id_ean = Column(Text)
 
-    territorial_scope = Column(JSONB)
+    territorial_scope = Column(VARIANT)
     application_date = Column(Date)
     decision_facts = Column(Text)
 
     source_type = Column(Text)
     source_identity = Column(Text)
 
-    automated_detection = Column(Boolean)  # Yes/No → True/False
+    automated_detection = Column(Boolean)
     automated_decision = Column(Text)
 
     platform_name = Column(Text)
     platform_uid = Column(Text)
 
-    created_at = Column(TIMESTAMP)  # their created_at
+    created_at = Column(TIMESTAMP(timezone=True))
+    loaded_at = Column(
+        TIMESTAMP(timezone=True), server_default=func.current_timestamp()
+    )
 
     ingestion = relationship("IngestionLedger", back_populates="statements")
 
