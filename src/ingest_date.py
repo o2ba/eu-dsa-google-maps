@@ -53,25 +53,33 @@ def ingest_date_snowflake(date: str, target_platform: str = "Google Maps"):
         delete_file(path=extract_dir, context="cleanup")
 
 
-def _process_and_load_snowflake(file: str, target_platform: str, event_id: str, date: str) -> int:
+def _process_and_load_snowflake(
+    file: str, target_platform: str, event_id: str, date: str
+) -> int:
     """
-    Transform a file (filter + normalize), write to temp parquet,
-    and load into Snowflake via PUT + COPY INTO.
+    Transform a file (filter + normalize), write to temp parquet with a descriptive name,
+    and load into Snowflake via PUT + COPY INTO. Progress is streamed with tqdm.write().
     """
+    base = os.path.splitext(os.path.basename(file))[0]  # e.g. "part-0001"
+    platform_tag = target_platform.lower().replace(" ", "")  # e.g. "googlemaps"
+    label = f"{date}-{platform_tag}-{base}"
+
+    # Transform
     normalized_df = _transform_file(file, target_platform, event_id)
     if normalized_df is None or normalized_df.empty:
+        tqdm.write(f"[{label}] skipped (no rows after filter/normalize)")
         return 0
+    tqdm.write(f"[{label}] normalized {len(normalized_df)} rows")
 
     # Build descriptive normalized file name
     tmp_dir = tempfile.mkdtemp(prefix=f"snowflake_norm_{event_id}_")
-    base = os.path.splitext(os.path.basename(file))[0]  # e.g., "part-0001"
-    platform_tag = target_platform.lower().replace(" ", "")  # e.g., "googlemaps"
-    norm_filename = f"sor-{date}-{platform_tag}-{base}-norm.parquet"
+    norm_filename = f"sor-{label}-norm.parquet"
     norm_file = os.path.join(tmp_dir, norm_filename)
 
     # Write normalized dataframe to parquet
     table = pa.Table.from_pandas(normalized_df, preserve_index=False)
     pq.write_table(table, norm_file)
+    tqdm.write(f"[{label}] wrote parquet → {norm_file}")
 
     # Connect to Snowflake
     conn = snowflake.connector.connect(
@@ -87,6 +95,7 @@ def _process_and_load_snowflake(file: str, target_platform: str, event_id: str, 
     try:
         # Upload normalized parquet into STATEMENT_OF_REASONS table stage
         cs.execute(f"PUT file://{norm_file} @%STATEMENT_OF_REASONS AUTO_COMPRESS=TRUE")
+        tqdm.write(f"[{label}] PUT complete")
 
         # Copy into table: case-insensitive column matching
         cs.execute("""
@@ -96,6 +105,7 @@ def _process_and_load_snowflake(file: str, target_platform: str, event_id: str, 
             MATCH_BY_COLUMN_NAME=CASE_INSENSITIVE
             ON_ERROR=CONTINUE;
         """)
+        tqdm.write(f"[{label}] COPY INTO complete")
 
         log_event(
             f"Loaded {len(normalized_df)} rows into Snowflake from {norm_filename}",
@@ -104,12 +114,12 @@ def _process_and_load_snowflake(file: str, target_platform: str, event_id: str, 
             rowcount=len(normalized_df),
         )
         return len(normalized_df)
+
     finally:
         cs.close()
         conn.close()
         delete_file(path=file, context="post-load cleanup")
         delete_file(path=norm_file, context="temp parquet cleanup")
-
 
 def _land_extract(date: str, event_id: str):
     """Download, unzip, and find parquet files for a given date."""
