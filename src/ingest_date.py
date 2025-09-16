@@ -50,7 +50,7 @@ def ingest_date_snowflake(date: str, target_platform: str = "Google Maps"):
             rowcount=total_rows,
         )
     finally:
-        delete_file(event_id=event_id, path=extract_dir, context="cleanup")
+        delete_file(path=extract_dir, context="cleanup")
 
 
 def _process_and_load_snowflake(file: str, target_platform: str, event_id: str, date: str) -> int:
