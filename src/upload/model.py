@@ -69,9 +69,9 @@ class StatementOfReasons(Base):
     platform_name = Column(Text)
     platform_uid = Column(Text)
 
-    created_at = Column(TIMESTAMP_TZ(timezone=True))
+    created_at = Column(TIMESTAMP_TZ)
     loaded_at = Column(
-        TIMESTAMP_TZ(timezone=True), server_default=func.current_timestamp()
+        TIMESTAMP_TZ, server_default=func.current_timestamp()
     )
 
 def get_model_schema(model_cls):
