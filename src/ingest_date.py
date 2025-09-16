@@ -37,7 +37,7 @@ def ingest_date_snowflake(date: str, target_platform: str = "Google Maps"):
         total_rows = 0
         with ThreadPoolExecutor(max_workers=5) as executor:
             futures = [
-                executor.submit(_process_and_load_snowflake, f, target_platform, event_id)
+                executor.submit(_process_and_load_snowflake, f, target_platform, event_id, date)
                 for f in parquet_files
             ]
             for f in tqdm(as_completed(futures), total=len(futures), desc=f"Processing {date}"):
@@ -53,7 +53,7 @@ def ingest_date_snowflake(date: str, target_platform: str = "Google Maps"):
         delete_file(event_id=event_id, path=extract_dir, context="cleanup")
 
 
-def _process_and_load_snowflake(file: str, target_platform: str, event_id: str) -> int:
+def _process_and_load_snowflake(file: str, target_platform: str, event_id: str, date: str) -> int:
     """
     Transform a file (filter + normalize), write to temp parquet,
     and load into Snowflake via PUT + COPY INTO.
@@ -62,9 +62,14 @@ def _process_and_load_snowflake(file: str, target_platform: str, event_id: str) 
     if normalized_df is None or normalized_df.empty:
         return 0
 
+    # Build descriptive normalized file name
     tmp_dir = tempfile.mkdtemp(prefix=f"snowflake_norm_{event_id}_")
-    norm_file = os.path.join(tmp_dir, os.path.basename(file).replace(".parquet", "-norm.parquet"))
+    base = os.path.splitext(os.path.basename(file))[0]  # e.g., "part-0001"
+    platform_tag = target_platform.lower().replace(" ", "")  # e.g., "googlemaps"
+    norm_filename = f"sor-{date}-{platform_tag}-{base}-norm.parquet"
+    norm_file = os.path.join(tmp_dir, norm_filename)
 
+    # Write normalized dataframe to parquet
     table = pa.Table.from_pandas(normalized_df, preserve_index=False)
     pq.write_table(table, norm_file)
 
@@ -80,9 +85,10 @@ def _process_and_load_snowflake(file: str, target_platform: str, event_id: str) 
     cs = conn.cursor()
 
     try:
+        # Upload normalized parquet into STATEMENT_OF_REASONS table stage
         cs.execute(f"PUT file://{norm_file} @%STATEMENT_OF_REASONS AUTO_COMPRESS=TRUE")
 
-        # Copy into table
+        # Copy into table: case-insensitive column matching
         cs.execute("""
             COPY INTO STATEMENT_OF_REASONS
             FROM @%STATEMENT_OF_REASONS
@@ -92,9 +98,9 @@ def _process_and_load_snowflake(file: str, target_platform: str, event_id: str) 
         """)
 
         log_event(
-            f"Loaded {len(normalized_df)} rows into Snowflake from {file}",
+            f"Loaded {len(normalized_df)} rows into Snowflake from {norm_filename}",
             event_id=event_id,
-            file=file,
+            file=norm_filename,
             rowcount=len(normalized_df),
         )
         return len(normalized_df)
