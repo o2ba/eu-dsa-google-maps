@@ -1,13 +1,9 @@
-"""
-Runs the pipeline to ingest data for a single day into Snowflake.
-"""
 import os
 import tempfile
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 from uuid import uuid4
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 import snowflake.connector
 
@@ -28,20 +24,16 @@ SNOWFLAKE_SCHEMA = os.getenv("SNOWFLAKE_SCHEMA", "PUBLIC")
 
 def ingest_date_snowflake(date: str, target_platform: str = "Google Maps"):
     """
-    Ingest a given day's parquet files into Snowflake.
+    Ingest a given day's parquet files into Snowflake (sequentially).
     """
     event_id = str(uuid4())
     extract_dir, parquet_files = _land_extract(date, event_id)
 
     try:
         total_rows = 0
-        with ThreadPoolExecutor(max_workers=5) as executor:
-            futures = [
-                executor.submit(_process_and_load_snowflake, f, target_platform, event_id, date)
-                for f in parquet_files
-            ]
-            for f in tqdm(as_completed(futures), total=len(futures), desc=f"Processing {date}"):
-                total_rows += f.result()
+        for f in tqdm(parquet_files, desc=f"Processing {date}"):
+            rows = _process_and_load_snowflake(f, target_platform, event_id, date)
+            total_rows += rows
 
         log_event(
             f"Ingested {total_rows} rows for {date}",
@@ -120,6 +112,7 @@ def _process_and_load_snowflake(
         conn.close()
         delete_file(path=file, context="post-load cleanup")
         delete_file(path=norm_file, context="temp parquet cleanup")
+
 
 def _land_extract(date: str, event_id: str):
     """Download, unzip, and find parquet files for a given date."""

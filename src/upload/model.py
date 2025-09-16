@@ -4,7 +4,7 @@ from sqlalchemy.orm import declarative_base
 from sqlalchemy import Column
 from snowflake.sqlalchemy import VARIANT, STRING
 from sqlalchemy.orm import declarative_base
-from snowflake.sqlalchemy import TIMESTAMP_TZ
+from snowflake.sqlalchemy import TIMESTAMP_TZ, TIMESTAMP_LTZ
 
 Base = declarative_base()
 
@@ -71,7 +71,8 @@ class StatementOfReasons(Base):
 
     created_at = Column(TIMESTAMP_TZ)
     loaded_at = Column(
-        TIMESTAMP_TZ, server_default=func.current_timestamp()
+        TIMESTAMP_LTZ,
+        server_default=func.current_timestamp()
     )
 
 def get_model_schema(model_cls):

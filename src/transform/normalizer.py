@@ -10,6 +10,16 @@ def normalize_df(df: pd.DataFrame, model_cls, file: str) -> pd.DataFrame:
 
     for col_name, col_type in schema.items():
         if col_name in df.columns:
+            
+            if col_name == "created_at":
+                series = df[col_name]
+                if pd.api.types.is_numeric_dtype(series):
+                    series = pd.to_datetime(series, errors="coerce", unit="ms", utc=True)
+                else:
+                    series = pd.to_datetime(series, errors="coerce", utc=True)
+                normalized[col_name] = series.dt.tz_convert("UTC")
+                continue
+
             normalized[col_name] = df[col_name].apply(
                 lambda v: convert_value(v, col_type, col_name, file)
             )

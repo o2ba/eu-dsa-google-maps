@@ -1,5 +1,4 @@
 from datetime import datetime, timedelta
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import typer
 
 from ingest_date import ingest_date_snowflake
@@ -25,7 +24,6 @@ def main(
     date: str = typer.Option(None, "--date", "-d"),
     date_range: str = typer.Option(None, "--range", "-r"),
     target_platform: str = typer.Option("Google Maps", "--platform", "-p"),
-    max_threads: int = typer.Option(5, "--max-threads"),
 ):
     """
     Run daily or ranged ingestion into Snowflake.
@@ -49,21 +47,16 @@ def main(
 
     typer.echo(
         f"[ℹ] Processing {len(dates)} dates "
-        f"from {dates[0]} → {dates[-1]} "
-        f"with {max_threads} threads"
+        f"from {dates[0]} → {dates[-1]}"
     )
 
-    with ThreadPoolExecutor(max_workers=max_threads) as executor:
-        futures = {
-            executor.submit(ingest_date_snowflake, d, target_platform): d for d in dates
-        }
-        for fut in as_completed(futures):
-            d = futures[fut]
-            try:
-                fut.result()
-                typer.echo(f"[✔] {d} complete")
-            except Exception as e:
-                typer.echo(f"[✘] {d} failed: {e}")
+    for d in dates:
+        try:
+            typer.echo(f"[ℹ] Starting ingestion for {d}")
+            ingest_date_snowflake(d, target_platform)
+            typer.echo(f"[✔] {d} complete")
+        except Exception as e:
+            typer.echo(f"[✘] {d} failed: {e}")
 
 
 if __name__ == "__main__":
