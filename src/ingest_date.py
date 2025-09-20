@@ -7,11 +7,9 @@ from uuid import uuid4
 from tqdm import tqdm
 import snowflake.connector
 
-from upload.model import StatementOfReasons
 from utils.temp_utils import create_temp_dir, delete_file
 from utils.logger import log_event
 from land import downloader, unzipper, explorer
-from transform.normalizer import normalize_df
 from utils.pd_utils import df_from_parquet
 
 SNOWFLAKE_USER = os.getenv("SNOWFLAKE_USER")
@@ -24,7 +22,7 @@ SNOWFLAKE_SCHEMA = os.getenv("SNOWFLAKE_SCHEMA", "PUBLIC")
 
 def ingest_date_snowflake(date: str, target_platform: str = "Google Maps"):
     """
-    Ingest a given day's parquet files into Snowflake (sequentially).
+    Ingest a given day's parquet files into a RAW staging table in Snowflake.
     """
     event_id = str(uuid4())
     extract_dir, parquet_files = _land_extract(date, event_id)
@@ -32,46 +30,49 @@ def ingest_date_snowflake(date: str, target_platform: str = "Google Maps"):
     try:
         total_rows = 0
         for f in tqdm(parquet_files, desc=f"Processing {date}"):
-            rows = _process_and_load_snowflake(f, target_platform, event_id, date)
+            rows = _stage_raw_snowflake(f, target_platform, event_id, date)
             total_rows += rows
 
         log_event(
-            f"Ingested {total_rows} rows for {date}",
+            f"Staged {total_rows} raw rows for {date}",
             event_id=event_id,
-            event_type="ingestion_summary",
+            event_type="raw_stage_summary",
             rowcount=total_rows,
         )
     finally:
         delete_file(path=extract_dir, context="cleanup")
 
 
-def _process_and_load_snowflake(
-    file: str, target_platform: str, event_id: str, date: str
-) -> int:
+def _stage_raw_snowflake(file: str, target_platform: str, event_id: str, date: str) -> int:
     """
-    Transform a file (filter + normalize), write to temp parquet with a descriptive name,
-    and load into Snowflake via PUT + COPY INTO. Progress is streamed with tqdm.write().
+    Filter parquet to target platform, stage to Snowflake @raw stage.
+    No type normalization is applied. Data will be loaded into RAW variant table.
     """
-    base = os.path.splitext(os.path.basename(file))[0]  # e.g. "part-0001"
-    platform_tag = target_platform.lower().replace(" ", "")  # e.g. "googlemaps"
+    base = os.path.splitext(os.path.basename(file))[0]
+    platform_tag = target_platform.lower().replace(" ", "")
     label = f"{date}-{platform_tag}-{base}"
 
-    # Transform
-    normalized_df = _transform_file(file, target_platform, event_id)
-    if normalized_df is None or normalized_df.empty:
-        tqdm.write(f"[{label}] skipped (no rows after filter/normalize)")
+    # Load parquet
+    raw_df = df_from_parquet(file)
+    delete_file(path=file, context="post-read cleanup")
+
+    df = raw_df.loc[raw_df["platform_name"] == target_platform].copy()
+    if df.empty:
+        tqdm.write(f"[{label}] skipped (no rows after filter)")
         return 0
-    tqdm.write(f"[{label}] normalized {len(normalized_df)} rows")
+    
+    df["file_date"] = date
 
-    # Build descriptive normalized file name
-    tmp_dir = tempfile.mkdtemp(prefix=f"snowflake_norm_{event_id}_")
-    norm_filename = f"sor-{label}-norm.parquet"
-    norm_file = os.path.join(tmp_dir, norm_filename)
+    tqdm.write(f"[{label}] stage {len(df)} rows")
 
-    # Write normalized dataframe to parquet
-    table = pa.Table.from_pandas(normalized_df, preserve_index=False)
-    pq.write_table(table, norm_file)
-    tqdm.write(f"[{label}] wrote parquet → {norm_file}")
+    # Write to parquet (unchanged, no cleaning). We’ll load as VARIANT.
+    tmp_dir = tempfile.mkdtemp(prefix=f"snowflake_raw_{event_id}_")
+    pq_filename = f"sor-{label}.parquet"
+    pq_file = os.path.join(tmp_dir, pq_filename)
+
+    table = pa.Table.from_pandas(df, preserve_index=False)
+    pq.write_table(table, pq_file)
+    tqdm.write(f"[{label}] wrote raw parquet → {pq_file}")
 
     # Connect to Snowflake
     conn = snowflake.connector.connect(
@@ -85,34 +86,35 @@ def _process_and_load_snowflake(
     cs = conn.cursor()
 
     try:
-        # Upload normalized parquet into STATEMENT_OF_REASONS table stage
-        cs.execute(f"PUT file://{norm_file} @%STATEMENT_OF_REASONS AUTO_COMPRESS=TRUE")
+        # Ensure a RAW staging table exists
+        cs.execute("""
+            CREATE TABLE IF NOT EXISTS SOR_RAW (record VARIANT)
+        """)
+
+        # Use a file format that preserves logical types
+        cs.execute("""
+            CREATE OR REPLACE FILE FORMAT parquet_ff
+            TYPE = PARQUET
+            USE_LOGICAL_TYPE = TRUE
+        """)
+
+        cs.execute(f"PUT file://{pq_file} @%SOR_RAW AUTO_COMPRESS=TRUE")
         tqdm.write(f"[{label}] PUT complete")
 
-        # Copy into table: case-insensitive column matching
+        # Copy into raw table (everything goes into the variant column)
         cs.execute("""
-            COPY INTO STATEMENT_OF_REASONS
-            FROM @%STATEMENT_OF_REASONS
-            FILE_FORMAT=(TYPE=PARQUET)
-            MATCH_BY_COLUMN_NAME=CASE_INSENSITIVE
-            ON_ERROR=CONTINUE
-            FORCE=TRUE;
+            COPY INTO SOR_RAW
+            FROM @%SOR_RAW
+            FILE_FORMAT=parquet_ff
+            ON_ERROR=CONTINUE;
         """)
-        tqdm.write(f"[{label}] COPY INTO complete")
+        tqdm.write(f"[{label}] COPY INTO RAW complete")
 
-        log_event(
-            f"Loaded {len(normalized_df)} rows into Snowflake from {norm_filename}",
-            event_id=event_id,
-            file=norm_filename,
-            rowcount=len(normalized_df),
-        )
-        return len(normalized_df)
-
+        return len(df)
     finally:
         cs.close()
         conn.close()
-        delete_file(path=file, context="post-load cleanup")
-        delete_file(path=norm_file, context="temp parquet cleanup")
+        delete_file(path=pq_file, context="temp parquet cleanup")
 
 
 def _land_extract(date: str, event_id: str):
@@ -123,27 +125,3 @@ def _land_extract(date: str, event_id: str):
     delete_file(path=tmp_file, context="post-unzip cleanup")
     parquet_files = explorer.find_parquet_files(unzipped_path, event_id=event_id)
     return extract_dir, parquet_files
-
-
-def _transform_file(file: str, target_platform: str, event_id: str):
-    """Read parquet → filter → normalize dataframe."""
-    raw_df = df_from_parquet(file)
-    delete_file(path=file, context="post-read cleanup")
-
-    # Filter by platform
-    raw_df = raw_df.loc[raw_df["platform_name"] == target_platform]
-    if raw_df.empty:
-        return None
-
-    # Pass the model class so normalize_df can map schema
-    normalized_df = normalize_df(raw_df, StatementOfReasons, file)
-    if normalized_df.empty:
-        log_event(
-            f"No valid data after normalization: {file}",
-            level="warning",
-            file=file,
-            event_id=event_id,
-        )
-        return None
-
-    return normalized_df
